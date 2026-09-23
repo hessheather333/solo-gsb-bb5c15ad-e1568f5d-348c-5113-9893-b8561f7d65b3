@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import re
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Optional
 from typing_extensions import Annotated
 
@@ -166,4 +167,53 @@ class ApiKeyResponse(BaseModel):
 class ApiKeyRevokedResponse(BaseModel):
     key_id: str
     revoked: bool
+
+
+# --- Admin dataset catalog ---
+
+
+class DatasetStatus(str, Enum):
+    """Catalog lifecycle: draft -> active -> archived (terminal)."""
+
+    draft = "draft"
+    active = "active"
+    archived = "archived"
+
+
+# Allowed next state for each lifecycle status.
+DATASET_TRANSITIONS: dict[DatasetStatus, frozenset[DatasetStatus]] = {
+    DatasetStatus.draft: frozenset({DatasetStatus.active}),
+    DatasetStatus.active: frozenset({DatasetStatus.archived}),
+    DatasetStatus.archived: frozenset(),
+}
+
+
+class CreateDatasetRequest(BaseModel):
+    dataset_id: Identifier = Field(..., description="Stable identifier used by releases, transfers and key scopes")
+    name: KeyName = Field(..., description="Human-readable dataset name")
+    default_budget: FiniteFloat = Field(
+        ..., ge=0, description="Total epsilon budget seeded for this dataset"
+    )
+
+    model_config = {"extra": "forbid"}
+
+
+class DatasetResponse(BaseModel):
+    dataset_id: str
+    name: str
+    default_budget: float
+    status: DatasetStatus
+    version: int
+    created_at: str
+    updated_at: str
+
+
+class LifecycleRequest(BaseModel):
+    # The status the caller believes the dataset is in now; it must match the
+    # next legal state for the current status and the stored version must
+    # match, otherwise 409.
+    target_status: DatasetStatus = Field(..., alias="status")
+    version: int = Field(..., ge=1, description="Current catalog version (optimistic concurrency)")
+
+    model_config = {"extra": "forbid", "populate_by_name": True}
 

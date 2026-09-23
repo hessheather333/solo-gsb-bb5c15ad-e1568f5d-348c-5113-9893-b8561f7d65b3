@@ -81,6 +81,26 @@ MIGRATIONS: tuple[str, ...] = (
 
     PRAGMA user_version = 2;
     """,
+    # v3: admin-managed dataset catalog with a draft -> active -> archived
+    # lifecycle. Releases/transfers/key grants are gated on a catalogued
+    # dataset's status; datasets without a catalog row keep the legacy
+    # implicit-dataset behavior, so no foreign key is enforced.
+    """
+    CREATE TABLE IF NOT EXISTS datasets (
+        dataset_id     TEXT PRIMARY KEY,
+        name           TEXT NOT NULL,
+        default_budget REAL NOT NULL,
+        status         TEXT NOT NULL DEFAULT 'draft'
+                       CHECK (status IN ('draft', 'active', 'archived')),
+        -- Optimistic-concurrency token: every legal lifecycle transition
+        -- bumps it; a PATCH must present the current value or it gets 409.
+        version        INTEGER NOT NULL DEFAULT 1 CHECK (version >= 1),
+        created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        updated_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    );
+
+    PRAGMA user_version = 3;
+    """,
 )
 
 

@@ -20,6 +20,13 @@ answers while charging a per-dataset ε (epsilon) privacy budget.
   explicit list of datasets; out-of-scope access returns `403`. Only the
   SHA-256 hash of a key is stored, and the plaintext is shown once at
   creation.
+- **Admin dataset catalog:** datasets are registered by an administrator with
+  `POST /admin/datasets` (id, name, default ε budget) and move through a
+  `draft → active → archived` lifecycle via optimistic-concurrency PATCHes.
+  Releases, budget transfers and **new key grants** are only accepted against
+  `active` datasets; archived datasets reject new writes but keep their
+  history (releases replay, budgets stay readable). Datasets that were never
+  registered keep the legacy implicit-dataset behavior.
 
 ## Authentication
 
@@ -68,7 +75,8 @@ dataset list is required (1–100 ids; duplicates are ignored).
 ```
 
 Status codes: `201` created; `401` missing/invalid admin token; `403` a
-data-plane API key was used (admin token required); `422` invalid body.
+data-plane API key was used (admin token required); `409` a listed catalogued
+dataset is not `active`; `422` invalid body.
 
 ### `DELETE /auth/keys/{key_id}` (admin token only)
 
@@ -85,6 +93,9 @@ never be re-minted; every later request with it returns `401`.
 
 Any mismatch returns `403` with `{"detail": {"error": "dataset_out_of_scope",
 ...}}`. Keys carry an explicit dataset id list; there is no wildcard.
+Granting a key on a catalogued dataset additionally requires that dataset to
+be `active` — grants on `draft`/`archived` datasets return
+`409 dataset_not_active` (uncatalogued datasets remain grantable).
 
 Security properties: only `sha256(token)` is stored (tokens contain 256 bits
 of CSPRNG entropy); comparison uses `hmac.compare_digest`, including a dummy
@@ -92,15 +103,117 @@ digest comparison for unknown key ids so the unknown-key path takes the same
 work as the known-key one; revoked and expired keys are rejected on every
 request.
 
+## Dataset catalog (admin token only)
+
+Administrators manage the lifecycle of datasets; every catalog endpoint uses
+the same admin token as `/auth/keys` in the `X-API-Key` header. A catalogued
+dataset is in exactly one of three states:
+
+```
+ draft ──activate──▶ active ──archive──▶ archived   (terminal)
+```
+
+- **draft** — registered but not usable: releases and transfers are refused
+  (`409 dataset_not_active`) and no API key can be granted on it.
+- **active** — the only state on which releases, budget transfers and new key
+  grants are accepted.
+- **archived** — frozen: every new write is refused with `409`, but historical
+  releases remain replayable (same idempotency key, no extra charge) and
+  `GET /budgets/{id}` keeps reporting the used/remaining amounts.
+
+Datasets that have no catalog row (created implicitly by older clients or by
+a budget transfer) are not gated and keep working exactly as before.
+
+### `POST /admin/datasets`
+
+Register a dataset. It starts in `draft` with `version = 1`; its budget row is
+seeded with `default_budget` unless one already exists, in which case the
+existing balance is preserved.
+
+```json
+{
+  "dataset_id": "sales",
+  "name": "Worldwide sales pipeline",
+  "default_budget": 1.0
+}
+```
+
+`201` response:
+
+```json
+{
+  "dataset_id": "sales",
+  "name": "Worldwide sales pipeline",
+  "default_budget": 1.0,
+  "status": "draft",
+  "version": 1,
+  "created_at": "2026-09-23T10:00:00.000Z",
+  "updated_at": "2026-09-23T10:00:00.000Z"
+}
+```
+
+Status codes: `201` created; `401` missing/invalid admin token; `403` a
+data-plane key was used; `409 dataset_already_exists` the id is already
+registered; `422` invalid body (`default_budget < 0` / non-finite, bad id,
+extra fields, …).
+
+### `PATCH /admin/datasets/{dataset_id}/lifecycle`
+
+Apply the next legal transition. The body names the desired `status` and the
+catalog `version` the client last saw (optimistic concurrency):
+
+```json
+{ "status": "active", "version": 1 }
+```
+
+On success the row is updated and `version` is incremented (`draft` v1 →
+`active` v2 → `archived` v3). Both checks run inside a single
+`BEGIN IMMEDIATE` SQLite transaction:
+
+- **stale or repeated version** (`version` is not the current one, including a
+  retried PATCH after the transition already committed) →
+  `409 version_conflict` with `expected_version`;
+- **illegal transition** (e.g. `draft → archived`, anything out of
+  `archived`) with a current version → `409 invalid_lifecycle_transition`;
+- unknown `dataset_id` → `404`; bad body → `422`.
+
+Because the conditional `UPDATE ... WHERE status = ? AND version = ?` itself
+pins the row, concurrent PATCHes serialize: exactly one succeeds, the rest
+receive `409`.
+
+### `GET /admin/datasets`
+
+List the whole catalog, ordered by `dataset_id`; add
+`?status=draft|active|archived` to filter. Returns an array of the same
+objects as the create/PATCH responses.
+
+### How lifecycle state interacts with data-plane calls
+
+| Call                                   | `draft`              | `active` | `archived`                     |
+|----------------------------------------|----------------------|----------|--------------------------------|
+| `POST /releases` (new idempotency key) | `409`                | allowed  | `409` (new writes refused)     |
+| `POST /releases` (replay existing key) | replays stored row\* | replays  | replays stored row, no charge  |
+| `POST /budgets/transfer`               | `409`                | allowed  | `409`                          |
+| `POST /auth/keys` (grant on dataset)   | `409`                | allowed  | `409`                          |
+| `GET /budgets/{id}`                    | allowed              | allowed  | allowed (history preserved)    |
+
+\*A replay can only exist for a dataset that was previously `active`; a
+`draft` row has never accepted a write. The `409` body is
+`{"detail": {"error": "dataset_not_active", "dataset_id": ..., "status": ...,
+"operation": "release"|"transfer"|"grant_api_key"}}`.
+
 ## Endpoints
 
 | Method | Path                    | Auth                         | Description                                        |
 |--------|-------------------------|------------------------------|----------------------------------------------------|
+| POST   | `/admin/datasets`       | admin token                  | Register a dataset (`draft`, default budget)       |
+| PATCH  | `/admin/datasets/{id}/lifecycle` | admin token         | `draft→active→archived` with version check         |
+| GET    | `/admin/datasets`       | admin token                  | List catalog (optional `?status=` filter)          |
 | POST   | `/auth/keys`            | admin token                  | Create a scoped API key (plaintext returned once)  |
 | DELETE | `/auth/keys/{key_id}`   | admin token                  | Revoke an API key                                  |
-| POST   | `/releases`             | API key covering `dataset_id`| Validate budget, deduct ε, return a noised release |
-| POST   | `/budgets/transfer`     | API key covering both sides  | Move unused ε quota from one dataset to another    |
-| GET    | `/budgets/{dataset_id}` | API key covering the dataset | Used and remaining budget only                     |
+| POST   | `/releases`             | API key covering `dataset_id`; dataset must be `active` | Validate budget, deduct ε, return a noised release |
+| POST   | `/budgets/transfer`     | API key covering both sides; both datasets `active` | Move unused ε quota from one dataset to another    |
+| GET    | `/budgets/{dataset_id}` | API key covering the dataset | Used and remaining budget (works in every state)   |
 | GET    | `/health`               | none                         | Health check                                       |
 | GET    | `/docs`                 | none                         | Interactive Swagger UI                             |
 
@@ -144,7 +257,8 @@ Status codes:
 - `200` — release created, or identical idempotent retry replayed
 - `401` — missing, invalid, revoked or expired `X-API-Key`
 - `403` — the key's scope does not include `dataset_id`
-- `409` — idempotency key already exists with different parameters
+- `409` — idempotency key already exists with different parameters, or the
+  catalogued dataset is not `active` (`draft`/`archived`)
 - `402` — remaining budget is smaller than the requested ε
 - `422` — invalid request (ε/sensitivity ≤ 0, NaN/Infinity, bad id, …)
 
@@ -212,7 +326,8 @@ Status codes:
 - `401` — missing, invalid, revoked or expired `X-API-Key`
 - `403` — the key does not cover both the source and target datasets
 - `409` — `transfer_id` already exists with different parameters
-  (`source_dataset`, `target_dataset` or `epsilon` changed)
+  (`source_dataset`, `target_dataset` or `epsilon` changed), or either
+  catalogued dataset is not `active`
 - `402` — source has less than `epsilon` unused quota remaining; the body
   identifies the source, the available remainder and the requested amount
 - `422` — invalid request: same source and target, `epsilon ≤ 0`,
@@ -311,8 +426,31 @@ temporary database, including concurrency races):
 ## Try it
 
 ```bash
+# 0. Register datasets in the catalog and activate them (admin token).
+#    Draft datasets refuse releases/transfers/key grants until activated.
+curl -s -X POST http://localhost:8000/admin/datasets \
+  -H "X-API-Key: $DP_ADMIN_API_KEY" -H 'Content-Type: application/json' \
+  -d '{"dataset_id":"sales","name":"Worldwide sales","default_budget":1.0}'
+# -> {"status":"draft","version":1,...}
+
+curl -s -X PATCH http://localhost:8000/admin/datasets/sales/lifecycle \
+  -H "X-API-Key: $DP_ADMIN_API_KEY" -H 'Content-Type: application/json' \
+  -d '{"status":"active","version":1}'
+# -> {"status":"active","version":2,...}
+
+curl -s -X POST http://localhost:8000/admin/datasets \
+  -H "X-API-Key: $DP_ADMIN_API_KEY" -H 'Content-Type: application/json' \
+  -d '{"dataset_id":"marketing","name":"Marketing","default_budget":1.0}'
+curl -s -X PATCH http://localhost:8000/admin/datasets/marketing/lifecycle \
+  -H "X-API-Key: $DP_ADMIN_API_KEY" -H 'Content-Type: application/json' \
+  -d '{"status":"active","version":1}'
+
+# inspect the catalog (optionally ?status=active)
+curl -s http://localhost:8000/admin/datasets -H "X-API-Key: $DP_ADMIN_API_KEY"
+
 # 1. Mint an API key with the admin token (save the returned api_key now;
-#    the plaintext is never shown again)
+#    the plaintext is never shown again). Grants only succeed against active
+#    catalogued datasets.
 curl -s -X POST http://localhost:8000/auth/keys \
   -H "X-API-Key: $DP_ADMIN_API_KEY" \
   -H 'Content-Type: application/json' \
@@ -348,6 +486,14 @@ curl -s http://localhost:8000/budgets/marketing -H "X-API-Key: $KEY"
 # 3. Revoke the key (admin token); it stops authenticating immediately
 curl -s -X DELETE http://localhost:8000/auth/keys/<key_id> \
   -H "X-API-Key: $DP_ADMIN_API_KEY"
+
+# 4. Archive a dataset (version 2 came back from the activate call): new
+#    releases/transfers/grants then fail with 409, while GET /budgets/sales
+#    and idempotent replays keep working.
+curl -s -X PATCH http://localhost:8000/admin/datasets/sales/lifecycle \
+  -H "X-API-Key: $DP_ADMIN_API_KEY" -H 'Content-Type: application/json' \
+  -d '{"status":"archived","version":2}'
+# Repeating the same PATCH (or any transition out of archived) returns 409.
 ```
 
 ## Design notes
@@ -385,3 +531,17 @@ curl -s -X DELETE http://localhost:8000/auth/keys/<key_id> \
   authentication uses a short WAL read that never blocks readers. Schema
   upgrades run through `PRAGMA user_version`-stamped migrations, so existing
   databases gain the auth tables without losing budget/release data.
+- **Dataset catalog and lifecycle:** the v3 migration adds a `datasets` table
+  (`dataset_id`, `name`, `default_budget`, `status`, monotonic `version`,
+  timestamps). New releases and transfers look up the catalog inside their
+  existing write transaction and fail with `409 dataset_not_active` unless the
+  dataset is `active` (or has no catalog row, preserving the implicit-dataset
+  behavior); key creation applies the same gate before inserting scopes.
+  Lifecycle PATCHes are optimistic-concurrency updates: the presented
+  `version` is checked (stale/duplicate → `409 version_conflict`) and the
+  state machine is checked (`draft→active→archived` only; illegal leg with a
+  current version → `409 invalid_lifecycle_transition`) inside one
+  `BEGIN IMMEDIATE` transaction, and the final
+  `UPDATE ... WHERE status=? AND version=?` guarantees that racing PATCHes
+  cannot double-apply a transition. Archiving never deletes data, so release
+  replays and budget reads keep working after the fact.
