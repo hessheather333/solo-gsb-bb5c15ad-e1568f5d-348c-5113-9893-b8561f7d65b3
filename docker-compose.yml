@@ -1,0 +1,36 @@
+services:
+  dp-api:
+    build: .
+    image: dp-budget-api:latest
+    container_name: dp-budget-api
+    ports:
+      - "8000:8000"
+    environment:
+      # Total epsilon budget granted to every dataset by default.
+      DP_TOTAL_BUDGET: "1.0"
+      # Optional per-dataset overrides: dataset1:0.5,dataset2:2.0
+      # DP_DATASET_BUDGETS: ""
+      # Server-side HMAC key for reproducible noise.
+      # Generate one with: openssl rand -hex 32
+      # If unset, a random key is generated and persisted to the volume.
+      DP_SERVER_KEY: "${DP_SERVER_KEY:-}"
+      # Admin token for POST/DELETE /auth/keys (sent as X-API-Key).
+      # Generate one with: openssl rand -hex 32
+      # If unset, a random admin token is generated and persisted to
+      # /data/admin.key (mode 0600); read it from the volume on first boot.
+      DP_ADMIN_API_KEY: "${DP_ADMIN_API_KEY:-}"
+      DATABASE_PATH: /data/dp.db
+      APP_HOST: 0.0.0.0
+      APP_PORT: "8000"
+    volumes:
+      - dp-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health').read()"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  dp-data:
