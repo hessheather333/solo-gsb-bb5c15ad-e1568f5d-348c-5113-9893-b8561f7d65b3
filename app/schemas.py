@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import re
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Literal, Optional
 from typing_extensions import Annotated
 
 from pydantic import (
@@ -166,4 +166,57 @@ class ApiKeyResponse(BaseModel):
 class ApiKeyRevokedResponse(BaseModel):
     key_id: str
     revoked: bool
+
+
+# --- Admin-managed dataset catalog ---
+
+DatasetStatus = Literal["draft", "active", "archived"]
+LifecycleAction = Literal["activate", "archive"]
+
+# Zero is a legal default budget (a dataset can exist with no spendable
+# quota), but NaN/Infinity and negatives are rejected by allow_inf_nan/ge.
+DefaultBudget = Annotated[float, Field(allow_inf_nan=False, ge=0)]
+DatasetVersion = Annotated[int, Field(ge=0)]
+DatasetName = Annotated[
+    str,
+    StringConstraints(min_length=1, max_length=200, strip_whitespace=True),
+]
+
+
+class CreateDatasetRequest(BaseModel):
+    dataset_id: Identifier = Field(
+        ..., description="Stable identifier; the dataset is created in 'draft'"
+    )
+    name: DatasetName = Field(..., description="Human-readable label")
+    default_budget: DefaultBudget = Field(
+        ..., description="Total epsilon seeded when the budget row is first used"
+    )
+
+    model_config = {"extra": "forbid"}
+
+
+class DatasetResponse(BaseModel):
+    dataset_id: str
+    name: str
+    status: DatasetStatus
+    version: int
+    default_budget: float
+    created_at: str
+    updated_at: str
+
+
+class DatasetListResponse(BaseModel):
+    datasets: list[DatasetResponse]
+
+
+class LifecycleRequest(BaseModel):
+    # Optimistic-locking token: must equal the row's current version. The
+    # version is incremented on every successful transition.
+    version: DatasetVersion
+    action: LifecycleAction = Field(
+        ...,
+        description="'activate': draft -> active; 'archive': active -> archived",
+    )
+
+    model_config = {"extra": "forbid"}
 

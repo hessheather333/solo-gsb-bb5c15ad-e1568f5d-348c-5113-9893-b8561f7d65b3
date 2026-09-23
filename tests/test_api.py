@@ -29,7 +29,9 @@ from app.db import connect, init_db  # noqa: E402
 PORT = 8765
 
 # Every dataset touched by the legacy test suite; the main data key is scoped
-# to all of them.
+# to all of them. They must be registered and activated through the admin
+# catalog before any data-plane traffic (new grants/releases/transfers only
+# target active datasets).
 _MAIN_DATASETS = [
     "ds", "race", "idem", "idem2", "tiny",
     "t11-src", "t11-dst", "t12-src", "t12-dst",
@@ -38,7 +40,49 @@ _MAIN_DATASETS = [
     "t15",
     "pool", "pool-dst",
     "chain", "chain2", "fan", "fan2", "x", "y",
+    # Scope/validation tests:
+    "alpha", "beta", "gamma", "delta",
+    "secret-ds", "rev-ds", "exp-ds", "tamper-ds",
+    # test_28 mints keys for cc-0 .. cc-23, which must already be active.
+    *[f"cc-{i}" for i in range(24)],
 ]
+
+
+def _create_dataset(
+    dataset_id: str,
+    *,
+    name: str | None = None,
+    default_budget: float = 1.0,
+    admin: str = ADMIN_KEY,
+):
+    return _request(
+        "POST",
+        "/admin/datasets",
+        {
+            "dataset_id": dataset_id,
+            "name": name if name is not None else f"catalog {dataset_id}",
+            "default_budget": default_budget,
+        },
+        api_key=admin,
+    )
+
+
+def _activate_dataset(dataset_id: str, version: int = 0, admin: str = ADMIN_KEY):
+    return _request(
+        "PATCH",
+        f"/admin/datasets/{dataset_id}/lifecycle",
+        {"version": version, "action": "activate"},
+        api_key=admin,
+    )
+
+
+def _archive_dataset(dataset_id: str, version: int, admin: str = ADMIN_KEY):
+    return _request(
+        "PATCH",
+        f"/admin/datasets/{dataset_id}/lifecycle",
+        {"version": version, "action": "archive"},
+        api_key=admin,
+    )
 
 # Populated in setUpClass after the server starts.
 DATA_KEY: str = ""
@@ -130,6 +174,19 @@ class ApiTests(unittest.TestCase):
                 time.sleep(0.1)
         else:
             raise RuntimeError("test server failed to start")
+
+        # Register and activate every legacy-test dataset through the admin
+        # catalog first; "tiny" carries its per-dataset 0.5 budget.
+        for dataset_id in _MAIN_DATASETS:
+            default_budget = 0.5 if dataset_id == "tiny" else 1.0
+            code, body = _create_dataset(
+                dataset_id, default_budget=default_budget
+            )
+            assert code == 201, body
+            assert body["status"] == "draft" and body["version"] == 0, body
+            code, body = _activate_dataset(dataset_id)
+            assert code == 200, body
+            assert body["status"] == "active" and body["version"] == 1, body
 
         # Bootstrapped main data key covering every legacy-test dataset.
         global DATA_KEY, DATA_KEY_ID
@@ -803,8 +860,366 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(status, 401)
 
 
+# --- Admin-managed dataset catalog ---
+# (catalog tests run inside ApiTests so they share its class-level server)
+
+
+def _grant_scope_directly(key_id: str, dataset_id: str) -> None:
+    """Add a scope row outside the API, so unknown/draft datasets can be
+    reached by a key and reach the catalog gate (rather than the 403 scope
+    check)."""
+    conn = connect()
+    try:
+        conn.execute(
+            "INSERT INTO api_key_scopes (key_id, dataset_id) VALUES (?, ?)",
+            (key_id, dataset_id),
+        )
+    finally:
+        conn.close()
+
+
+    def test_30_admin_paths_require_admin_token(self) -> None:
+        # No key.
+        status, _ = _request(
+            "POST", "/admin/datasets",
+            {"dataset_id": "a30", "name": "n", "default_budget": 1.0},
+            api_key="",
+        )
+        self.assertEqual(status, 401)
+        # Wrong token.
+        status, _ = _request("GET", "/admin/datasets", api_key="wrong-admin")
+        self.assertEqual(status, 401)
+        # A valid data-plane key is never an administrator.
+        status, _ = _request("GET", "/admin/datasets", api_key=DATA_KEY)
+        self.assertEqual(status, 403)
+        status, _ = _request(
+            "PATCH", "/admin/datasets/ds/lifecycle",
+            {"version": 1, "action": "archive"}, api_key=DATA_KEY,
+        )
+        self.assertEqual(status, 403)
+
+    def test_31_create_dataset_starts_draft(self) -> None:
+        status, body = _create_dataset("cat31", default_budget=0.75)
+        self.assertEqual(status, 201, body)
+        self.assertEqual(
+            set(body),
+            {"dataset_id", "name", "status", "version", "default_budget",
+             "created_at", "updated_at"},
+        )
+        self.assertEqual(body["dataset_id"], "cat31")
+        self.assertEqual(body["status"], "draft")
+        self.assertEqual(body["version"], 0)
+        self.assertEqual(body["default_budget"], 0.75)
+        self.assertTrue(body["created_at"] and body["updated_at"])
+
+        # Duplicate dataset_id is 409.
+        status, body = _create_dataset("cat31", default_budget=2.0)
+        self.assertEqual(status, 409)
+        self.assertEqual(body["detail"]["error"], "dataset_already_exists")
+        self.assertEqual(body["detail"]["dataset_id"], "cat31")
+
+    def test_32_create_dataset_validation(self) -> None:
+        bad_bodies = [
+            {"dataset_id": "", "name": "n", "default_budget": 1.0},
+            {"dataset_id": "ok-id", "name": "", "default_budget": 1.0},
+            {"dataset_id": "ok-id2", "name": "n", "default_budget": -0.01},
+            {"dataset_id": "ok-id3", "name": "n", "default_budget": float("nan")},
+            {"dataset_id": "ok-id4", "name": "n", "default_budget": 1.0,
+             "extra": 1},
+        ]
+        for payload in bad_bodies:
+            status, _ = _request(
+                "POST", "/admin/datasets", payload, api_key=ADMIN_KEY
+            )
+            self.assertEqual(status, 422, payload)
+
+        # Zero default budget is legal.
+        status, body = _create_dataset("cat32-zero", default_budget=0.0)
+        self.assertEqual(status, 201, body)
+        self.assertEqual(body["default_budget"], 0.0)
+
+    def test_33_list_datasets_and_status_filter(self) -> None:
+        for ds in ("cat33-a", "cat33-b", "cat33-c"):
+            status, _ = _create_dataset(ds)
+            self.assertEqual(status, 201)
+        status, _ = _activate_dataset("cat33-b")
+        self.assertEqual(status, 200)
+
+        status, body = _request("GET", "/admin/datasets", api_key=ADMIN_KEY)
+        self.assertEqual(status, 200)
+        by_id = {d["dataset_id"]: d for d in body["datasets"]}
+        # Pre-registered legacy datasets plus the new ones are all listed,
+        # ordered by dataset_id.
+        ids = [d["dataset_id"] for d in body["datasets"]]
+        self.assertEqual(ids, sorted(ids))
+        self.assertLessEqual(
+            {"cat33-a", "cat33-b", "cat33-c", "ds"}.difference(by_id), set()
+        )
+        self.assertEqual(by_id["cat33-b"]["status"], "active")
+        self.assertEqual(by_id["cat33-a"]["status"], "draft")
+
+        status, body = _request(
+            "GET", "/admin/datasets?status=draft", api_key=ADMIN_KEY
+        )
+        self.assertEqual(status, 200)
+        listed = {d["dataset_id"] for d in body["datasets"]}
+        self.assertIn("cat33-a", listed)
+        self.assertNotIn("cat33-b", listed)
+
+        status, body = _request(
+            "GET", "/admin/datasets?status=archived", api_key=ADMIN_KEY
+        )
+        self.assertEqual(status, 200)
+        self.assertNotIn("cat33-a", {d["dataset_id"] for d in body["datasets"]})
+
+        status, body = _request(
+            "GET", "/admin/datasets?status=bogus", api_key=ADMIN_KEY
+        )
+        self.assertEqual(status, 422)
+        locs = [tuple(err["loc"]) for err in body["detail"]]
+        self.assertIn(("query", "status"), locs)
+
+    def test_34_lifecycle_draft_active_archived(self) -> None:
+        status, _ = _create_dataset("cat34")
+        self.assertEqual(status, 201)
+
+        # draft -> activate
+        status, body = _activate_dataset("cat34", version=0)
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["status"], "active")
+        self.assertEqual(body["version"], 1)
+        self.assertNotEqual(body["updated_at"], body["created_at"])
+
+        # active -> archive
+        status, body = _archive_dataset("cat34", version=1)
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["status"], "archived")
+        self.assertEqual(body["version"], 2)
+
+    def test_35_illegal_transitions_are_409(self) -> None:
+        status, _ = _create_dataset("cat35-a")
+        self.assertEqual(status, 201)
+        status, _ = _create_dataset("cat35-b")
+        self.assertEqual(status, 201)
+        status, _ = _activate_dataset("cat35-b")
+        self.assertEqual(status, 200)
+
+        # A draft cannot be archived directly.
+        status, body = _archive_dataset("cat35-a", version=0)
+        self.assertEqual(status, 409, body)
+        self.assertEqual(body["detail"]["error"], "invalid_lifecycle_transition")
+        self.assertEqual(body["detail"]["status"], "draft")
+
+        # Activate the first, archive it, then both directions are illegal.
+        status, _ = _activate_dataset("cat35-a")
+        self.assertEqual(status, 200)
+        status, _ = _archive_dataset("cat35-a", version=1)
+        self.assertEqual(status, 200)
+        status, body = _activate_dataset("cat35-a", version=2)
+        self.assertEqual(status, 409)
+        self.assertEqual(body["detail"]["error"], "invalid_lifecycle_transition")
+        status, body = _archive_dataset("cat35-a", version=2)
+        self.assertEqual(status, 409)
+        self.assertEqual(body["detail"]["status"], "archived")
+
+        # An active dataset cannot be activated twice.
+        status, body = _activate_dataset("cat35-b", version=1)
+        self.assertEqual(status, 409)
+
+        # Unknown dataset on PATCH is 404.
+        status, body = _activate_dataset("cat35-missing")
+        self.assertEqual(status, 404)
+        self.assertEqual(body["detail"]["error"], "dataset_not_found")
+
+    def test_36_stale_version_is_409(self) -> None:
+        status, _ = _create_dataset("cat36")
+        self.assertEqual(status, 201)
+
+        # Sending the same (draft, v0, activate) twice: the first advances to
+        # v1 active, the second is a stale/duplicate version -> 409.
+        status, first = _activate_dataset("cat36", version=0)
+        self.assertEqual(status, 200)
+        status, body = _activate_dataset("cat36", version=0)
+        self.assertEqual(status, 409)
+        self.assertEqual(body["detail"]["error"], "version_conflict")
+        self.assertEqual(body["detail"]["current_version"], 1)
+        self.assertEqual(body["detail"]["provided_version"], 0)
+        self.assertEqual(first["version"], 1)
+
+        # Future versions also conflict.
+        status, body = _archive_dataset("cat36", version=99)
+        self.assertEqual(status, 409)
+        self.assertEqual(body["detail"]["error"], "version_conflict")
+
+    def test_37_concurrent_activate_one_wins(self) -> None:
+        status, _ = _create_dataset("cat37")
+        self.assertEqual(status, 201)
+
+        def call(_i: int):
+            return _activate_dataset("cat37", version=0)[0]
+
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            codes = list(pool.map(call, range(16)))
+        self.assertEqual(codes.count(200), 1, codes)
+        self.assertEqual(codes.count(409), 15, codes)
+
+        status, body = _request("GET", "/admin/datasets?status=active",
+                                api_key=ADMIN_KEY)
+        by_id = {d["dataset_id"]: d for d in body["datasets"]}
+        self.assertEqual(by_id["cat37"]["version"], 1)
+
+    def test_38_new_grants_require_active(self) -> None:
+        # Draft datasets cannot be granted to new keys.
+        status, _ = _create_dataset("cat38-draft")
+        self.assertEqual(status, 201)
+        status, body = _create_key(["cat38-draft"], name="grant draft")
+        self.assertEqual(status, 409, body)
+        self.assertEqual(body["detail"]["error"], "dataset_not_active")
+        self.assertEqual(body["detail"]["status"], "draft")
+
+        # Unknown datasets cannot be granted either.
+        status, body = _create_key(["cat38-missing"], name="grant missing")
+        self.assertEqual(status, 404, body)
+        self.assertEqual(body["detail"]["error"], "dataset_not_found")
+
+        # Activated: the grant succeeds.
+        status, _ = _activate_dataset("cat38-draft")
+        self.assertEqual(status, 200)
+        status, body = _create_key(["cat38-draft"], name="grant active")
+        self.assertEqual(status, 201, body)
+
+        # Archived: new grants are refused.
+        status, _ = _archive_dataset("cat38-draft", version=1)
+        self.assertEqual(status, 200)
+        status, body = _create_key(["cat38-draft"], name="grant archived")
+        self.assertEqual(status, 409)
+        self.assertEqual(body["detail"]["status"], "archived")
+
+    def test_39_release_requires_active_unknown_is_404(self) -> None:
+        # Draft: an in-scope key gets 409 from the catalog gate.
+        status, _ = _create_dataset("cat39-draft")
+        self.assertEqual(status, 201)
+        _, key_body = _create_key(["ds"], name="cat39 holder")
+        _grant_scope_directly(key_body["key_id"], "cat39-draft")
+        status, body = _request(
+            "POST", "/releases",
+            {"dataset_id": "cat39-draft", "query_id": "q", "epsilon": 0.1,
+             "sensitivity": 1.0, "true_value": 1.0, "idempotency_key": "c39d"},
+            api_key=key_body["api_key"],
+        )
+        self.assertEqual(status, 409, body)
+        self.assertEqual(body["detail"]["error"], "dataset_not_active")
+
+        # Unknown dataset that is nonetheless in scope: 404 (not 402 seeded
+        # from a default, and not 403 scope).
+        _grant_scope_directly(key_body["key_id"], "cat39-ghost")
+        status, body = _request(
+            "POST", "/releases",
+            {"dataset_id": "cat39-ghost", "query_id": "q", "epsilon": 0.1,
+             "sensitivity": 1.0, "true_value": 1.0, "idempotency_key": "c39g"},
+            api_key=key_body["api_key"],
+        )
+        self.assertEqual(status, 404, body)
+        self.assertEqual(body["detail"]["error"], "dataset_not_found")
+
+    def test_40_archived_blocks_writes_but_keeps_history(self) -> None:
+        status, _ = _create_dataset("cat40", default_budget=1.0)
+        self.assertEqual(status, 201)
+        status, _ = _activate_dataset("cat40")
+        self.assertEqual(status, 200)
+        status, key_body = _create_key(["cat40"], name="cat40 key")
+        self.assertEqual(status, 201)
+        key = key_body["api_key"]
+
+        release = {
+            "dataset_id": "cat40", "query_id": "q", "epsilon": 0.3,
+            "sensitivity": 1.0, "true_value": 10.0, "idempotency_key": "c40-1",
+        }
+        status, first = _request("POST", "/releases", release, api_key=key)
+        self.assertEqual(status, 200, first)
+        status, budget_before = _request("GET", "/budgets/cat40", api_key=key)
+        self.assertEqual(status, 200)
+
+        # Archive.
+        status, body = _archive_dataset("cat40", version=1)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["status"], "archived")
+
+        # A brand-new release is refused.
+        status, body = _request(
+            "POST", "/releases",
+            {**release, "idempotency_key": "c40-2"}, api_key=key,
+        )
+        self.assertEqual(status, 409, body)
+        self.assertEqual(body["detail"]["error"], "dataset_not_active")
+        self.assertEqual(body["detail"]["status"], "archived")
+
+        # Historical queries survive: budget view and the idempotent replay.
+        status, budget_after = _request("GET", "/budgets/cat40", api_key=key)
+        self.assertEqual(status, 200)
+        self.assertEqual(budget_after, budget_before)
+        status, replay = _request("POST", "/releases", release, api_key=key)
+        self.assertEqual(status, 200)
+        self.assertEqual(replay, first)
+
+    def test_41_transfer_requires_active_both_sides(self) -> None:
+        # active source, archived target -> 409 on target.
+        for ds in ("cat41-a", "cat41-b", "cat41-c"):
+            status, _ = _create_dataset(ds)
+            self.assertEqual(status, 201)
+            status, _ = _activate_dataset(ds)
+            self.assertEqual(status, 200)
+        status, key_body = _create_key(
+            ["cat41-a", "cat41-b", "cat41-c"], name="cat41 key"
+        )
+        self.assertEqual(status, 201)
+        key = key_body["api_key"]
+
+        status, _ = _archive_dataset("cat41-b", version=1)
+        self.assertEqual(status, 200)
+
+        status, body = _request(
+            "POST", "/budgets/transfer",
+            {"transfer_id": "c41-1", "source_dataset": "cat41-a",
+             "target_dataset": "cat41-b", "epsilon": 0.1},
+            api_key=key,
+        )
+        self.assertEqual(status, 409, body)
+        self.assertEqual(body["detail"]["error"], "dataset_not_active")
+        self.assertEqual(body["detail"]["dataset_id"], "cat41-b")
+
+        # Archived source is also refused.
+        status, _ = _archive_dataset("cat41-a", version=1)
+        self.assertEqual(status, 200)
+        status, body = _request(
+            "POST", "/budgets/transfer",
+            {"transfer_id": "c41-2", "source_dataset": "cat41-a",
+             "target_dataset": "cat41-c", "epsilon": 0.1},
+            api_key=key,
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(body["detail"]["dataset_id"], "cat41-a")
+
+        # Unknown side is 404.
+        _grant_scope_directly(key_body["key_id"], "cat41-ghost")
+        status, body = _request(
+            "POST", "/budgets/transfer",
+            {"transfer_id": "c41-3", "source_dataset": "cat41-c",
+             "target_dataset": "cat41-ghost", "epsilon": 0.1},
+            api_key=key,
+        )
+        self.assertEqual(status, 404)
+        self.assertEqual(body["detail"]["dataset_id"], "cat41-ghost")
+
+        # Nothing moved.
+        status, budget = _request("GET", "/budgets/cat41-c", api_key=key)
+        self.assertEqual(status, 200)
+        self.assertEqual(budget["used_budget"], 0.0)
+        self.assertEqual(budget["remaining_budget"], 1.0)
+
+
 class MigrationTests(unittest.TestCase):
-    """The v1 schema must upgrade in place to the key schema (user_version)."""
+    """Old schemas must upgrade in place (PRAGMA user_version)."""
 
     def test_existing_v1_database_is_upgraded(self) -> None:
         tmp = Path(_TMP) / "migration"
@@ -822,6 +1237,12 @@ class MigrationTests(unittest.TestCase):
             conn.execute(
                 "INSERT INTO budgets (dataset_id, total, used) VALUES ('old-ds', 0.9, 0.1)"
             )
+            conn.execute(
+                "INSERT INTO releases (id, idempotency_key, dataset_id, query_id, "
+                "epsilon, sensitivity, true_value, noise, released_value, "
+                "budget_used, budget_remaining) VALUES "
+                "('r1', 'ik1', 'rel-ds', 'q', 0.1, 1.0, 1.0, 0.0, 1.0, 0.1, 0.9)"
+            )
         finally:
             conn.close()
 
@@ -829,7 +1250,7 @@ class MigrationTests(unittest.TestCase):
 
         conn = connect(str(db_path))
         try:
-            self.assertEqual(int(conn.execute("PRAGMA user_version").fetchone()[0]), 2)
+            self.assertEqual(int(conn.execute("PRAGMA user_version").fetchone()[0]), 3)
             tables = {
                 r[0]
                 for r in conn.execute(
@@ -838,11 +1259,67 @@ class MigrationTests(unittest.TestCase):
             }
             self.assertIn("api_keys", tables)
             self.assertIn("api_key_scopes", tables)
+            self.assertIn("datasets", tables)
             # Existing data survives the migration.
             row = conn.execute(
                 "SELECT total, used FROM budgets WHERE dataset_id = 'old-ds'"
             ).fetchone()
             self.assertEqual((row["total"], row["used"]), (0.9, 0.1))
+
+            # v3 backfills every referenced dataset as active, adopting the
+            # existing budget total as its default.
+            catalog = {
+                r["dataset_id"]: r
+                for r in conn.execute(
+                    "SELECT dataset_id, name, status, version, default_budget "
+                    "FROM datasets"
+                ).fetchall()
+            }
+            self.assertIn("old-ds", catalog)
+            self.assertEqual(catalog["old-ds"]["status"], "active")
+            self.assertEqual(catalog["old-ds"]["version"], 0)
+            self.assertEqual(catalog["old-ds"]["default_budget"], 0.9)
+            self.assertIn("rel-ds", catalog)
+            self.assertEqual(catalog["rel-ds"]["default_budget"], 1.0)
+        finally:
+            conn.close()
+
+    def test_v2_database_with_key_scopes_is_backfilled(self) -> None:
+        tmp = Path(_TMP) / "migration"
+        db_path = tmp / "v2.db"
+
+        from app.db import MIGRATIONS
+
+        conn = connect(str(db_path))
+        try:
+            conn.executescript(MIGRATIONS[0])
+            conn.executescript(MIGRATIONS[1])
+            # A key scoped to a dataset that has no budget row yet.
+            conn.execute(
+                "INSERT INTO api_keys (key_id, name, key_hash, key_prefix, "
+                "expires_at, revoked) VALUES ('kid', 'n', 'h', 'dpk_abcdef', NULL, 0)"
+            )
+            conn.execute(
+                "INSERT INTO api_key_scopes (key_id, dataset_id) "
+                "VALUES ('kid', 'scope-only-ds')"
+            )
+            self.assertEqual(int(conn.execute("PRAGMA user_version").fetchone()[0]), 2)
+        finally:
+            conn.close()
+
+        init_db(str(db_path))
+
+        conn = connect(str(db_path))
+        try:
+            self.assertEqual(int(conn.execute("PRAGMA user_version").fetchone()[0]), 3)
+            row = conn.execute(
+                "SELECT status, default_budget FROM datasets WHERE dataset_id = ?",
+                ("scope-only-ds",),
+            ).fetchone()
+            self.assertIsNotNone(row)
+            self.assertEqual(row["status"], "active")
+            # No budget row existed: default comes from the configured total.
+            self.assertEqual(row["default_budget"], 1.0)
         finally:
             conn.close()
 

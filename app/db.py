@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -81,7 +81,66 @@ MIGRATIONS: tuple[str, ...] = (
 
     PRAGMA user_version = 2;
     """,
+    # v3: admin-managed dataset catalog with a draft -> active -> archived
+    # lifecycle and an optimistic-concurrency version counter. Post-migration
+    # Python code (see _POST_MIGRATE) backfills datasets referenced by v1/v2
+    # data so every pre-catalog deployment upgrades with all entries active.
+    """
+    CREATE TABLE IF NOT EXISTS datasets (
+        dataset_id     TEXT PRIMARY KEY,
+        name           TEXT NOT NULL,
+        status         TEXT NOT NULL DEFAULT 'draft'
+                           CHECK (status IN ('draft', 'active', 'archived')),
+        default_budget REAL NOT NULL,
+        version        INTEGER NOT NULL DEFAULT 0,
+        created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        updated_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    );
+
+    PRAGMA user_version = 3;
+    """,
 )
+
+# Python hooks run after a given migration's DDL, inside one write
+# transaction. Keyed by the schema version the hook completes.
+_POST_MIGRATE: dict[int, Callable[[sqlite3.Connection], None]] = {}
+
+
+def _backfill_datasets(conn: sqlite3.Connection) -> None:
+    """Register every dataset already referenced by v1/v2 data as active.
+
+    An upgraded deployment must keep working: existing budgets/releases/
+    transfers stay queryable, and keys scoped before the catalog existed must
+    still authenticate their datasets. The configured budget total is used
+    when a referenced dataset never had a budget row.
+    """
+    referenced = [
+        r[0]
+        for r in conn.execute(
+            "SELECT DISTINCT dataset_id FROM ("
+            "SELECT dataset_id FROM budgets "
+            "UNION SELECT dataset_id FROM releases "
+            "UNION SELECT source_dataset FROM transfers "
+            "UNION SELECT target_dataset FROM transfers "
+            "UNION SELECT dataset_id FROM api_key_scopes)"
+        ).fetchall()
+    ]
+    for dataset_id in referenced:
+        row = conn.execute(
+            "SELECT total FROM budgets WHERE dataset_id = ?", (dataset_id,)
+        ).fetchone()
+        default_budget = (
+            float(row["total"]) if row is not None else settings.budget_for(dataset_id)
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO datasets "
+            "(dataset_id, name, status, default_budget, version) "
+            "VALUES (?, ?, 'active', ?, 0)",
+            (dataset_id, dataset_id, default_budget),
+        )
+
+
+_POST_MIGRATE[3] = _backfill_datasets
 
 
 def connect(database_path: str | None = None) -> sqlite3.Connection:
@@ -118,6 +177,17 @@ def init_db(database_path: str | None = None) -> None:
             # executescript commits any pending transaction and runs the
             # whole migration atomically enough for DDL + the version stamp.
             conn.executescript(script)
+            hook = _POST_MIGRATE.get(index)
+            if hook is not None:
+                # Data backfills run in their own write transaction so the
+                # upgrade is all-or-nothing (autocommit connection).
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    hook(conn)
+                    conn.execute("COMMIT")
+                except Exception:
+                    conn.execute("ROLLBACK")
+                    raise
     finally:
         conn.close()
 

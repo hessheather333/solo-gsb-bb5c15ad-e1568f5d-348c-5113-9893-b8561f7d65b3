@@ -95,7 +95,7 @@ class Principal:
 
 @dataclass(frozen=True)
 class AdminPrincipal:
-    """The bootstrap admin token; may only manage keys."""
+    """The bootstrap admin token; manages keys and the dataset catalog."""
 
 
 def authenticate_key(token: str, conn: sqlite3.Connection) -> Principal | None:

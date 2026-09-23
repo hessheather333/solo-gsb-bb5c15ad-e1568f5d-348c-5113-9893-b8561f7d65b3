@@ -4,14 +4,14 @@ from __future__ import annotations
 import sqlite3
 import uuid
 from datetime import datetime, timedelta, timezone
+from typing import Literal, Optional
 
-from fastapi import FastAPI, HTTPException, Request, status
+from fastapi import FastAPI, HTTPException, Query, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 
 from . import auth as auth_mod
-from .config import settings
 from .db import connect, immediate_transaction, init_db
 from .privacy import derive_laplace_noise
 from .schemas import (
@@ -19,7 +19,11 @@ from .schemas import (
     ApiKeyRevokedResponse,
     BudgetResponse,
     CreateApiKeyRequest,
+    CreateDatasetRequest,
+    DatasetListResponse,
+    DatasetResponse,
     HealthResponse,
+    LifecycleRequest,
     ReleaseRequest,
     ReleaseResponse,
     TransferRequest,
@@ -29,7 +33,7 @@ from .security import resolve_server_key
 
 app = FastAPI(
     title="Differential Privacy Budget Release API",
-    version="1.1.0",
+    version="1.2.0",
     description="Charges epsilon budgets transactionally and releases "
     "Laplace-noised aggregates with idempotent retries. All endpoints except "
     "/health and /docs require an X-API-Key header.",
@@ -113,6 +117,30 @@ def _require_dataset(principal: auth_mod.Principal, dataset_id: str) -> None:
         )
 
 
+def _dataset_not_found(dataset_id: str) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail={"error": "dataset_not_found", "dataset_id": dataset_id},
+    )
+
+
+def _dataset_not_active(dataset_id: str, current_status: str) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={
+            "error": "dataset_not_active",
+            "dataset_id": dataset_id,
+            "status": current_status,
+        },
+    )
+
+
+def _load_dataset(conn: sqlite3.Connection, dataset_id: str) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM datasets WHERE dataset_id = ?", (dataset_id,)
+    ).fetchone()
+
+
 def _authenticate(presented: str) -> auth_mod.Principal | None:
     """Short WAL read resolving a presented key (off the event loop)."""
     conn = connect()
@@ -127,9 +155,10 @@ async def _api_key_middleware(request: Request, call_next):
     """Authenticate every request outside the public paths.
 
     /health and /docs (plus the OpenAPI document the UI consumes) are open.
-    /auth/keys* requires the bootstrap admin token (a data-plane key there is
-    403). Everything else requires a valid, unrevoked, unexpired API key;
-    dataset-level scope is enforced inside the individual handlers.
+    /auth/keys* and /admin/datasets* require the bootstrap admin token (a
+    data-plane key there is 403). Everything else requires a valid,
+    unrevoked, unexpired API key; dataset-level scope is enforced inside the
+    individual handlers.
     """
     path = request.url.path
     if path in _PUBLIC_PATHS or path.startswith("/docs"):
@@ -139,7 +168,12 @@ async def _api_key_middleware(request: Request, call_next):
     if not presented:
         return _unauthorized("Missing X-API-Key header")
 
-    is_admin_path = path == "/auth/keys" or path.startswith("/auth/keys/")
+    is_admin_path = (
+        path == "/auth/keys"
+        or path.startswith("/auth/keys/")
+        or path == "/admin/datasets"
+        or path.startswith("/admin/datasets/")
+    )
     if is_admin_path:
         if not auth_mod.authenticate_admin(presented, _admin_key):
             if presented.startswith("dpk_"):
@@ -231,6 +265,22 @@ def create_api_key(payload: CreateApiKeyRequest) -> ApiKeyResponse:
         created_at = auth_mod.utcnow_iso()
         try:
             with immediate_transaction() as conn:
+                # New grants may only target catalog entries that are active.
+                # Checked inside the write transaction so a concurrent
+                # activation/archive cannot interleave with the grant.
+                placeholders = ",".join("?" for _ in payload.dataset_ids)
+                rows = conn.execute(
+                    f"SELECT dataset_id, status FROM datasets "
+                    f"WHERE dataset_id IN ({placeholders})",
+                    list(payload.dataset_ids),
+                ).fetchall()
+                found = {row["dataset_id"]: row["status"] for row in rows}
+                for dataset_id in payload.dataset_ids:
+                    if dataset_id not in found:
+                        raise _dataset_not_found(dataset_id)
+                    if found[dataset_id] != "active":
+                        raise _dataset_not_active(dataset_id, found[dataset_id])
+
                 conn.execute(
                     "INSERT INTO api_keys "
                     "(key_id, name, key_hash, key_prefix, expires_at, revoked, created_at) "
@@ -290,6 +340,151 @@ def revoke_api_key(key_id: str) -> ApiKeyRevokedResponse:
     return ApiKeyRevokedResponse(key_id=key_id, revoked=True)
 
 
+# --- Admin-managed dataset catalog (admin token only) ---
+
+# Allowed lifecycle transitions: draft -> active -> archived (no way back).
+_LIFECYCLE_TRANSITIONS = {
+    ("draft", "activate"): "active",
+    ("active", "archive"): "archived",
+}
+
+
+def _row_to_dataset(row: sqlite3.Row) -> DatasetResponse:
+    return DatasetResponse(
+        dataset_id=row["dataset_id"],
+        name=row["name"],
+        status=row["status"],
+        version=int(row["version"]),
+        default_budget=float(row["default_budget"]),
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+@app.post(
+    "/admin/datasets",
+    response_model=DatasetResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["admin"],
+)
+def create_dataset(payload: CreateDatasetRequest) -> DatasetResponse:
+    """Register a dataset entry with a default epsilon budget.
+
+    New entries start in ``draft`` and cannot receive releases, transfers or
+    new key grants until activated. A pre-existing budget row (created by
+    pre-catalog traffic or a migration) is never overwritten; the default
+    budget only seeds a future budget row. Requires the admin token.
+    """
+    try:
+        with immediate_transaction() as conn:
+            conn.execute(
+                "INSERT INTO datasets (dataset_id, name, status, default_budget) "
+                "VALUES (?, ?, 'draft', ?)",
+                (payload.dataset_id, payload.name, payload.default_budget),
+            )
+            row = _load_dataset(conn, payload.dataset_id)
+    except sqlite3.IntegrityError:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "error": "dataset_already_exists",
+                "dataset_id": payload.dataset_id,
+            },
+        )
+    return _row_to_dataset(row)
+
+
+@app.patch(
+    "/admin/datasets/{dataset_id}/lifecycle",
+    response_model=DatasetResponse,
+    status_code=status.HTTP_200_OK,
+    tags=["admin"],
+)
+def update_dataset_lifecycle(
+    dataset_id: str, payload: LifecycleRequest
+) -> DatasetResponse:
+    """Move a dataset along the ``draft -> active -> archived`` state machine.
+
+    The request carries the optimistic-locking ``version`` last observed; the
+    transition is applied only inside a ``BEGIN IMMEDIATE`` transaction if that
+    version still matches. A duplicate (already applied) or stale/expired
+    version returns ``409``, as does an illegal transition for the current
+    status. Archived datasets reject new releases/transfers/grants but keep
+    serving historical queries and idempotent replays.
+    """
+    with immediate_transaction() as conn:
+        row = _load_dataset(conn, dataset_id)
+        if row is None:
+            raise _dataset_not_found(dataset_id)
+
+        current_status = row["status"]
+        current_version = int(row["version"])
+        if current_version != payload.version:
+            # Lost a race against another lifecycle change (or the version
+            # was never advanced because the caller re-sent an old request).
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "error": "version_conflict",
+                    "dataset_id": dataset_id,
+                    "current_version": current_version,
+                    "provided_version": payload.version,
+                },
+            )
+
+        next_status = _LIFECYCLE_TRANSITIONS.get((current_status, payload.action))
+        if next_status is None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "error": "invalid_lifecycle_transition",
+                    "dataset_id": dataset_id,
+                    "status": current_status,
+                    "action": payload.action,
+                },
+            )
+
+        conn.execute(
+            "UPDATE datasets "
+            "SET status = ?, version = version + 1, "
+            "updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') "
+            "WHERE dataset_id = ?",
+            (next_status, dataset_id),
+        )
+        row = _load_dataset(conn, dataset_id)
+    return _row_to_dataset(row)
+
+
+@app.get(
+    "/admin/datasets",
+    response_model=DatasetListResponse,
+    status_code=status.HTTP_200_OK,
+    tags=["admin"],
+)
+def list_datasets(
+    status_filter: Optional[Literal["draft", "active", "archived"]] = Query(
+        default=None,
+        alias="status",
+        description="Optional lifecycle status filter",
+    ),
+) -> DatasetListResponse:
+    """List catalog entries, optionally filtered by lifecycle status."""
+    conn = connect()
+    try:
+        if status_filter is None:
+            rows = conn.execute(
+                "SELECT * FROM datasets ORDER BY dataset_id"
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM datasets WHERE status = ? ORDER BY dataset_id",
+                (status_filter,),
+            ).fetchall()
+    finally:
+        conn.close()
+    return DatasetListResponse(datasets=[_row_to_dataset(row) for row in rows])
+
+
 def _row_to_release(row: sqlite3.Row) -> ReleaseResponse:
     return ReleaseResponse(
         id=row["id"],
@@ -342,7 +537,6 @@ def create_release(
     principal = _request_principal(request)
     _require_dataset(principal, payload.dataset_id)
     idem_key = _idempotency_key(request, payload)
-    total_budget = settings.budget_for(payload.dataset_id)
 
     try:
         with immediate_transaction() as conn:
@@ -357,16 +551,24 @@ def create_release(
                         detail="Idempotency key was already used with different parameters",
                     )
                 # Identical retry: replay the stored release, no extra charge.
-                # (A read-only transaction commits harmlessly on context exit.)
+                # Replays are allowed after archival: historical queries stay
+                # readable. (The read-only tx commits harmlessly on exit.)
                 return _row_to_release(existing)
+
+            # New writes only land on active datasets.
+            dataset = _load_dataset(conn, payload.dataset_id)
+            if dataset is None:
+                raise _dataset_not_found(payload.dataset_id)
+            if dataset["status"] != "active":
+                raise _dataset_not_active(payload.dataset_id, dataset["status"])
 
             # Ensure a budget row exists and lock/freeze it for this transaction.
             # A budget row may have been created/changed by a transfer, so on
-            # conflict do nothing: the configured total only seeds a new dataset.
+            # conflict do nothing: the catalog default only seeds a new dataset.
             conn.execute(
                 "INSERT INTO budgets (dataset_id, total, used) VALUES (?, ?, 0) "
                 "ON CONFLICT(dataset_id) DO NOTHING",
-                (payload.dataset_id, total_budget),
+                (payload.dataset_id, float(dataset["default_budget"])),
             )
             budget = conn.execute(
                 "SELECT total, used FROM budgets WHERE dataset_id = ?",
@@ -490,8 +692,6 @@ def transfer_budget(payload: TransferRequest, request: Request) -> TransferRespo
 
     source_id = payload.source_dataset
     target_id = payload.target_dataset
-    total_for_source = settings.budget_for(source_id)
-    total_for_target = settings.budget_for(target_id)
 
     try:
         with immediate_transaction() as conn:
@@ -509,17 +709,32 @@ def transfer_budget(payload: TransferRequest, request: Request) -> TransferRespo
                 # are untouched.
                 return _row_to_transfer(existing)
 
-            # Seed any missing budget row with its configured total. Inserting
+            # Both sides must exist and be active for new quota movement.
+            source_ds = _load_dataset(conn, source_id)
+            if source_ds is None:
+                raise _dataset_not_found(source_id)
+            target_ds = _load_dataset(conn, target_id)
+            if target_ds is None:
+                raise _dataset_not_found(target_id)
+            if source_ds["status"] != "active":
+                raise _dataset_not_active(source_id, source_ds["status"])
+            if target_ds["status"] != "active":
+                raise _dataset_not_active(target_id, target_ds["status"])
+
+            # Seed any missing budget row with the catalog default. Inserting
             # in a fixed (alphabetical) order keeps lock acquisition
             # deterministic across concurrent transfers.
             seed_ids = sorted(
-                {(source_id, total_for_source), (target_id, total_for_target)}
+                {
+                    (source_id, float(source_ds["default_budget"])),
+                    (target_id, float(target_ds["default_budget"])),
+                }
             )
-            for dataset_id, configured_total in seed_ids:
+            for dataset_id, default_total in seed_ids:
                 conn.execute(
                     "INSERT INTO budgets (dataset_id, total, used) VALUES (?, ?, 0) "
                     "ON CONFLICT(dataset_id) DO NOTHING",
-                    (dataset_id, configured_total),
+                    (dataset_id, default_total),
                 )
 
             # Read and freeze both balances within the write transaction.
@@ -618,22 +833,29 @@ def transfer_budget(payload: TransferRequest, request: Request) -> TransferRespo
 def get_budget(dataset_id: str, request: Request) -> BudgetResponse:
     principal = _request_principal(request)
     _require_dataset(principal, dataset_id)
-    configured_total = settings.budget_for(dataset_id)
     conn = connect()
     try:
-        row = conn.execute(
+        budget_row = conn.execute(
             "SELECT total, used FROM budgets WHERE dataset_id = ?",
+            (dataset_id,),
+        ).fetchone()
+        dataset_row = conn.execute(
+            "SELECT default_budget FROM datasets WHERE dataset_id = ?",
             (dataset_id,),
         ).fetchone()
     finally:
         conn.close()
-    if row is None:
-        total = configured_total
+    if dataset_row is None:
+        # Only catalog datasets are addressable; archived entries stay
+        # readable here (historical queries survive archival).
+        raise _dataset_not_found(dataset_id)
+    if budget_row is None:
+        total = float(dataset_row["default_budget"])
         used = 0.0
     else:
         # The stored total reflects quota moved in/out by transfers.
-        total = float(row["total"])
-        used = float(row["used"])
+        total = float(budget_row["total"])
+        used = float(budget_row["used"])
     return BudgetResponse(
         dataset_id=dataset_id,
         used_budget=used,
